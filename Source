@@ -1,0 +1,525 @@
+/***** HILTZ ZIP WORKFLOW — GEOCODE + SCORES + GEOJSON + SLIDES (Tailored) *****
+ Menu:
+   Hiltz Tools
+     1) Geocode missing Lat/Lng
+     2) Score viability + Rank
+     3) Export GeoJSON for My Maps
+     4) Build Slides Deck (ZIP filter)
+     Run All
+*******************************************************************************/
+
+const CONFIG = {
+  SHEET_NAME: 'Listings',
+  ZIP_FILTER: '89032',
+  SLIDES_TITLE: '89032 Charter School Site Report – Q3 2025',
+  TOP_N: 4,
+  API_KEY: '', // optional fallback; prefer Script Property MAPS_API_KEY
+  STATIC_MAP_MAX_MARKERS: 25,
+  GEOJSON_FILE_NAME: 'Hiltz_89032_Listings.geojson',
+
+  // EXACT column headers in your sheet
+  HEADERS: {
+    propertyId: 'Property ID',
+    address: 'Address',
+    cityZip: 'City/Zip',
+    school: 'School',
+    listingType: 'Listing Type',
+    totalSf: 'Total SF',
+    dollarSfMo: '$/SF/MO',
+    priceRent: 'Price/Rent',
+    annualCost: 'Annual Cost',
+    jurisdiction: 'Jurisdiction',
+    plannedLandUse: 'Planned Land Use',
+    zoning: 'Zoning',
+    propertyType: 'Property Type',
+    yearBuilt: 'Year Built',
+    parkingSpaces: 'Parking Spaces',
+    lotAc: 'Lot Size (AC)',
+    classMaxStudents: 'Classrooms Potential Max Students',
+
+    // geocode outputs (these columns must exist; we’ll add if missing)
+    lat: 'Lat',
+    lng: 'Lng',
+
+    // scoring outputs (we’ll add if missing)
+    sizeScore: 'Size Score (1-5)',
+    lotScore: 'Lot Score (1-5)',
+    zoningScore: 'Zoning Score (1-5)',
+    priceScore: 'Price Score (1-5)',
+    conditionScore: 'Condition Score (1-5)',
+    parkingScore: 'Parking Score (1-5)',
+    totalScore: 'Total Score (0-100)',
+    rank: 'Rank'
+  },
+
+  // Weights for total score
+  WEIGHTS: { size: 0.25, lot: 0.25, zoning: 0.20, price: 0.15, condition: 0.10, parking: 0.05 },
+
+  // Zoning tiers
+  ZONING_MAP: {
+    HIGH: ['PS','PF','PUBLIC','SCHOOL','CIVIC','PFI'],
+    MED:  ['CC','CG','C-1','C-2','COMM','COMMERCIAL','RETAIL','MU','MR','OR'],
+    LOW:  ['I','M','IND','LI','HI','OS','AG','R','RES','INDUSTRIAL']
+  },
+
+  // Thresholds (tune to market)
+  THRESHOLDS: {
+    minSf: 20000,
+    goodSf: 30000,
+    minAc: 2.0,
+    goodAc: 3.0,
+    newYear: 2000,
+    strongYear: 2010,
+    targetMonthlyPerSf: 1.75, // $/SF/Mo lease target
+    targetSalePerSf: 200
+  }
+};
+
+/* ===== Menu ===== */
+function onOpen() {
+  SpreadsheetApp.getUi().createMenu('Hiltz Tools')
+    .addItem('1) Geocode missing Lat/Lng', 'geocodeMissingLatLng')
+    .addItem('2) Score viability + Rank', 'scoreAndRank')
+    .addItem('3) Export GeoJSON for My Maps', 'exportGeoJSONForMyMaps')
+    .addItem('4) Build Slides Deck (ZIP filter)', 'buildSlidesForZip')
+    .addSeparator()
+    .addItem('Run All', 'runAll')
+    .addItem('Open Heatmap', 'openHeatmapSidebar') // requires Heatmap.html
+    .addToUi();
+}
+function runAll() {
+  geocodeMissingLatLng();
+  scoreAndRank();
+  exportGeoJSONForMyMaps();
+  buildSlidesForZip();
+}
+
+/* ===== Slides build with Static Map (safe text ops only) ===== */
+function buildSlidesForZip(){
+  const {rows} = readAll_(true);
+  if (!rows.length) {
+    SpreadsheetApp.getActive().toast(`No rows found for ZIP ${CONFIG.ZIP_FILTER}.`, 'Hiltz Tools');
+    return;
+  }
+
+  // score + sort
+  rows.forEach(r => r._s = computeScores_(r));
+  rows.sort((a,b) => b._s.total - a._s.total);
+
+  const pres = SlidesApp.create(CONFIG.SLIDES_TITLE);
+
+  // Title slide (remove defaults safely; never call clear())
+  const s0 = pres.getSlides()[0];
+  try { s0.getPageElements().forEach(pe => pe.remove()); } catch(e) {}
+
+  // Title
+  const titleBox = s0.insertShape(SlidesApp.ShapeType.TEXT_BOX, 60, 60, 800, 60);
+  try {
+    const t = titleBox.getText();
+    t.setText(CONFIG.SLIDES_TITLE);
+    t.getTextStyle().setFontSize(36).setBold(true);
+  } catch(e) {}
+
+  // Subtitle
+  const subBox = s0.insertShape(SlidesApp.ShapeType.TEXT_BOX, 60, 140, 800, 60);
+  try {
+    const t = subBox.getText();
+    t.setText('Hiltz Commercial Group\nAuto-generated from ' + CONFIG.SHEET_NAME);
+    t.getTextStyle().setFontSize(18);
+  } catch(e) {}
+
+  // Optional static map (blob only; no text ops)
+  const pts = rows.filter(r => r.lat && r.lng)
+                  .slice(0, CONFIG.STATIC_MAP_MAX_MARKERS)
+                  .map(r => `${r.lat},${r.lng}`);
+  const apiKey = mapsApiKey_();
+  if (pts.length && apiKey){
+    const url = buildStaticMapUrl_(pts, apiKey);
+    try {
+      const blob = UrlFetchApp.fetch(url).getBlob().setName('map.png');
+      s0.insertImage(blob).setLeft(60).setTop(220).setWidth(800);
+    } catch (e) {}
+  }
+
+  // Ranked table slide (BLANK layout, no placeholders)
+  const s1 = pres.appendSlide(SlidesApp.PredefinedLayout.BLANK);
+
+  const headBox = s1.insertShape(SlidesApp.ShapeType.TEXT_BOX, 40, 40, 900, 40);
+  try {
+    const t = headBox.getText();
+    t.setText(`Top ${Math.min(CONFIG.TOP_N, rows.length)} Viable Properties – ${CONFIG.ZIP_FILTER}`);
+    t.getTextStyle().setFontSize(24).setBold(true);
+  } catch(e) {}
+
+  const headers = ['Address','Listing Type','Total SF','Lot (AC)','Zoning','$/SF/MO','Annual Cost','Score'];
+  const data = rows.slice(0, CONFIG.TOP_N).map(r => ([
+    [r.address, r.cityZip].filter(Boolean).join(', '),
+    r.listingType || '',
+    String(r.totalSf || ''),
+    String(r.lotAc || ''),
+    r.zoning || '',
+    String(r.dollarSfMo || ''),
+    String(r.annualCost || ''),
+    String(Math.round(r._s.total))
+  ]));
+
+  const tbl = s1.insertTable(1 + data.length, headers.length);
+  try { tbl.setLeft(40); tbl.setTop(90); } catch(e) {}
+
+  // Header row
+  for (let i = 0; i < headers.length; i++){
+    try {
+      const cell = tbl.getCell(0, i);
+      const tr = cell.getText();
+      tr.setText(headers[i]);
+      tr.getTextStyle().setBold(true);
+    } catch(e) {}
+  }
+  // Data rows
+  for (let r = 0; r < data.length; r++){
+    for (let c = 0; c < headers.length; c++){
+      try {
+        const cell = tbl.getCell(1 + r, c);
+        const tr = cell.getText();
+        tr.setText(String(data[r][c] ?? ''));
+        tr.getTextStyle().setFontSize(11);
+      } catch(e) {}
+    }
+  }
+
+  // Footer
+  const footBox = s1.insertShape(SlidesApp.ShapeType.TEXT_BOX, 40, 520, 900, 20);
+  try {
+    const t = footBox.getText();
+    t.setText('Auto-generated • ' + new Date().toLocaleString());
+    t.getTextStyle().setFontSize(10);
+  } catch(e) {}
+
+  SpreadsheetApp.getActive().toast(`Slides: ${pres.getUrl()}`, 'Hiltz Tools');
+}
+
+/* ===== Geocoding ===== */
+function geocodeMissingLatLng() {
+  const key = mapsApiKey_();
+  if (!key) throw new Error('Set MAPS_API_KEY in Script Properties or CONFIG.API_KEY.');
+
+  const { rows, idx } = readAll_(false);
+  const sh = sh_();
+  const H = CONFIG.HEADERS;
+
+  if (idx[H.lat] == null || idx[H.lng] == null) {
+    throw new Error('Add "Lat" and "Lng" columns.');
+  }
+
+  const cache = CacheService.getScriptCache();
+  let updated = 0;
+
+  rows.forEach((rec) => {
+    try {
+      if (rec.lat && rec.lng) return;
+      const addr = (rec.address || '').toString().trim();
+      const zip = (rec.zip || '').toString().trim();
+      if (!addr || !zip) return;
+
+      const query = `${addr}, NV ${zip}`;
+      const k = 'geo:' + query;
+      let hit = cache.get(k);
+      let ll = hit ? JSON.parse(hit) : geocode_(query, key);
+
+      if (ll && typeof ll.lat === 'number' && typeof ll.lng === 'number') {
+        cache.put(k, JSON.stringify(ll), 21600); // 6h
+        sh.getRange(rec.rowIndex, idx[H.lat] + 1).setValue(ll.lat);
+        sh.getRange(rec.rowIndex, idx[H.lng] + 1).setValue(ll.lng);
+        updated++;
+        Utilities.sleep(150); // gentle throttle
+      }
+    } catch (e) {
+      Logger.log(`Geocode error on row ${rec && rec.rowIndex}: ${e}`);
+    }
+  });
+
+  SpreadsheetApp.getActive().toast(`Geocoded ${updated} row(s).`, 'Hiltz Tools');
+}
+function geocode_(address, key){
+  const url = 'https://maps.googleapis.com/maps/api/geocode/json?address='
+    + encodeURIComponent(address) + '&key=' + key;
+  const res = UrlFetchApp.fetch(url, {muteHttpExceptions:true});
+  const json = JSON.parse(res.getContentText());
+  if (json.status!=='OK' || !json.results?.length) return null;
+  const loc = json.results[0].geometry.location;
+  return {lat:loc.lat, lng:loc.lng};
+}
+
+/* ===== Scoring & Rank ===== */
+function scoreAndRank(){
+  const {rows, idx} = readAll_(false);
+  const sh=sh_(), H=CONFIG.HEADERS;
+
+  const sizeCol=idx[H.sizeScore]+1, lotCol=idx[H.lotScore]+1, zonCol=idx[H.zoningScore]+1,
+        priceCol=idx[H.priceScore]+1, condCol=idx[H.conditionScore]+1, parkCol=idx[H.parkingScore]+1,
+        totalCol=idx[H.totalScore]+1, rankCol=idx[H.rank]+1;
+
+  const scored = rows.map(r=>({...r, _s: computeScores_(r)}));
+
+  scored.forEach(s=>{
+    const r=s.rowIndex;
+    sh.getRange(r,sizeCol).setValue(round1_(s._s.size));
+    sh.getRange(r,lotCol).setValue(round1_(s._s.lot));
+    sh.getRange(r,zonCol).setValue(round1_(s._s.zoning));
+    sh.getRange(r,priceCol).setValue(round1_(s._s.price));
+    sh.getRange(r,condCol).setValue(round1_(s._s.condition));
+    sh.getRange(r,parkCol).setValue(round1_(s._s.parking));
+    sh.getRange(r,totalCol).setValue(Math.round(s._s.total));
+  });
+
+  scored.sort((a,b)=>b._s.total - a._s.total).forEach((s,i)=>{
+    sh.getRange(s.rowIndex, rankCol).setValue(i+1);
+  });
+
+  SpreadsheetApp.getActive().toast('Scored + ranked.', 'Hiltz Tools');
+}
+function computeScores_(rec){
+  const T=CONFIG.THRESHOLDS, W=CONFIG.WEIGHTS;
+
+  const sf = num_(rec.totalSf);
+  const size = sf>=T.goodSf ? 5 : (sf>=T.minSf?3.5:(sf?2:0));
+
+  const ac = num_(rec.lotAc);
+  const lot = ac>=T.goodAc ? 5 : (ac>=T.minAc?3.5:(ac?2:0));
+
+  const z = (rec.zoning||'').toUpperCase();
+  const zoning = hasAny_(z,CONFIG.ZONING_MAP.HIGH)?5
+               : hasAny_(z,CONFIG.ZONING_MAP.MED)?3
+               : hasAny_(z,CONFIG.ZONING_MAP.LOW)?2:1;
+
+  const price = priceScore_(rec, sf);
+
+  const yr = num_(rec.yearBuilt);
+  const condition = yr>=T.strongYear ? 5 : (yr>=T.newYear?3.5:(yr?2:0));
+
+  const pk = num_(rec.parkingSpaces);
+  const parking = pk>=80?5:pk>=50?4:pk>=25?3:(pk?2:0);
+
+  const total = (size*W.size + lot*W.lot + zoning*W.zoning + price*W.price + condition*W.condition + parking*W.parking)*20;
+  return {size,lot,zoning,price,condition,parking,total};
+}
+function priceScore_(rec, sf){
+  const T=CONFIG.THRESHOLDS;
+  const mo = num_(rec.dollarSfMo);
+  const annual = num_(rec.annualCost);
+  let leasePerMo = null;
+  if (mo) leasePerMo = mo;
+  else if (annual && sf) leasePerMo = (annual/12)/sf;
+
+  if (leasePerMo!=null){
+    return leasePerMo <= T.targetMonthlyPerSf ? 5
+         : leasePerMo <= T.targetMonthlyPerSf*1.15 ? 4
+         : leasePerMo <= T.targetMonthlyPerSf*1.35 ? 3
+         : leasePerMo <= T.targetMonthlyPerSf*1.6  ? 2 : 1;
+  }
+  return 3; // neutral if unknown
+}
+
+/* ===== GeoJSON export for My Maps ===== */
+function exportGeoJSONForMyMaps(){
+  const {rows} = readAll_(true);
+  const feats = rows.filter(r=>r.lat && r.lng).map(r=>({
+    type:'Feature',
+    geometry:{type:'Point',coordinates:[Number(r.lng),Number(r.lat)]},
+    properties:{
+      address:[r.address, r.cityZip].filter(Boolean).join(', '),
+      listingType:r.listingType,
+      size:r.totalSf,
+      price:r.priceRent,
+      zoning:r.zoning,
+      yearBuilt:r.yearBuilt,
+      parking:r.parkingSpaces,
+      lotAc:r.lotAc,
+      totalScore: computeScores_(r).total
+    }
+  }));
+  const fc={type:'FeatureCollection',features:feats};
+  const blob=Utilities.newBlob(JSON.stringify(fc,null,2),'application/json',CONFIG.GEOJSON_FILE_NAME);
+  const file=DriveApp.createFile(blob);
+  SpreadsheetApp.getActive().toast(`GeoJSON: ${file.getUrl()}`,'Hiltz Tools');
+}
+
+/* ===== Heatmap backend: normalized weights + ZIP-centroid fallback ===== */
+function getHeatmapPoints(zipList) {
+  const wantsAll = !zipList || !zipList.length || zipList.every(z => !String(z).trim());
+  const zips = new Set((zipList || []).map(z => String(z).trim()));
+
+  const sh = sh_();
+  const values = sh.getDataRange().getValues();
+  let headers = values[0];
+  headers = ensureColumns_(sh, headers, []); // ensure up-to-date headers ref
+  const idx = headerIdx_(headers);
+  const H = CONFIG.HEADERS;
+
+  const rows = [];
+  for (let r = 1; r < values.length; r++) {
+    const row = values[r];
+    const cityZip = row[idx[H.cityZip]] || '';
+    const zip = (String(cityZip).match(/(\d{5})(-\d{4})?$/) || [,''])[1];
+    if (!wantsAll && !zips.has(zip)) continue;
+
+    let lat = Number(row[idx[H.lat]]);
+    let lng = Number(row[idx[H.lng]]);
+    if (!isFinite(lat) || !isFinite(lng)) {
+      const c = zipCentroid_(zip);
+      if (!c) continue;
+      lat = c.lat; lng = c.lng;
+    }
+
+    const sfRaw = String(row[idx[H.totalSf]] || '').replace(/[, ]/g, '');
+    const sf = Number(sfRaw) || 0;
+    rows.push({ lat, lng, sf });
+  }
+
+  if (!rows.length) return { points: [], count: 0 };
+
+  // √-scale to damp outliers → normalize to 1..5
+  const sfs = rows.map(r => Math.sqrt(Math.max(0, r.sf)));
+  const minS = Math.min.apply(null, sfs);
+  const maxS = Math.max.apply(null, sfs);
+  const denom = (maxS - minS) || 1;
+
+  const points = rows.map((r, i) => {
+    const norm = (sfs[i] - minS) / denom; // 0..1
+    const weight = 1 + norm * 4;          // 1..5
+    return { lat: r.lat, lng: r.lng, weight };
+  });
+
+  return { points, count: points.length };
+}
+
+// ZIP centroid (cached)
+function zipCentroid_(zip) {
+  try {
+    const cache = CacheService.getScriptCache();
+    const key = 'zipC:' + zip;
+    const hit = cache.get(key);
+    if (hit) return JSON.parse(hit);
+
+    const url = 'https://maps.googleapis.com/maps/api/geocode/json?address='
+      + encodeURIComponent(`${zip} NV`) + '&key=' + mapsApiKey_();
+    const res = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+    const json = JSON.parse(res.getContentText());
+    if (json.status !== 'OK' || !json.results?.length) return null;
+    const loc = json.results[0].geometry.location;
+    const c = { lat: loc.lat, lng: loc.lng };
+    cache.put(key, JSON.stringify(c), 21600); // 6h
+    return c;
+  } catch (e) { 
+    return null; 
+  }
+}
+
+/* ===== Heatmap UI hooks (you provide Heatmap.html) ===== */
+function openHeatmapSidebar() {
+  const tpl = HtmlService.createTemplateFromFile('Heatmap'); // file named exactly "Heatmap"
+  tpl.API_KEY = mapsApiKey_();
+  SpreadsheetApp.getUi().showSidebar(tpl.evaluate().setTitle('Hiltz Heatmap'));
+}
+function doGet() { // optional published web app
+  const tpl = HtmlService.createTemplateFromFile('Heatmap');
+  tpl.API_KEY = mapsApiKey_();
+  return tpl.evaluate().setTitle('Hiltz Heatmap');
+}
+
+/* ===== Debug helper: count ZIPs present ===== */
+function debugZipCounts() {
+  const sh = sh_();
+  const v = sh.getDataRange().getValues();
+  const H = CONFIG.HEADERS;
+  const idx = v[0].reduce((m,h,i)=> (m[h]=i,m), {});
+  const counts = {};
+  for (let r=1;r<v.length;r++){
+    const zip = (String(v[r][idx[H.cityZip]]).match(/(\d{5})(-\d{4})?$/) || [,''])[1];
+    if (!zip) continue;
+    counts[zip] = (counts[zip] || 0) + 1;
+  }
+  Logger.log(counts);
+}
+
+/* ===== Core read helpers + utils ===== */
+function sh_(){ 
+  const s=SpreadsheetApp.getActive().getSheetByName(CONFIG.SHEET_NAME); 
+  if(!s) throw new Error(`Sheet "${CONFIG.SHEET_NAME}" not found.`); 
+  return s; 
+}
+function headerIdx_(headers){ const m={}; headers.forEach((h,i)=>m[h]=i); return m; }
+function safe_(row, idx){ return idx!=null ? row[idx] : ''; }
+
+function readAll_(zipOnly=true){
+  const sh=sh_();
+  const rng = sh.getDataRange().getValues();
+  if (rng.length<2) return {rows:[], headers:[], idx:{}};
+
+  // ensure columns exist and refresh header reference if we added any
+  let headers = ensureColumns_(sh, rng[0], [
+    CONFIG.HEADERS.lat, CONFIG.HEADERS.lng,
+    CONFIG.HEADERS.sizeScore, CONFIG.HEADERS.lotScore, CONFIG.HEADERS.zoningScore,
+    CONFIG.HEADERS.priceScore, CONFIG.HEADERS.conditionScore, CONFIG.HEADERS.parkingScore,
+    CONFIG.HEADERS.totalScore, CONFIG.HEADERS.rank
+  ]);
+  const idx = headerIdx_(headers);
+  const H = CONFIG.HEADERS;
+
+  const out=[];
+  for (let r=1;r<rng.length;r++){
+    const row=rng[r];
+    const cityZip=safe_(row,idx[H.cityZip]);
+    const zip=extractZip_(cityZip);
+    const rec={
+      rowIndex:r+1,
+      propertyId:safe_(row,idx[H.propertyId]),
+      address:safe_(row,idx[H.address]),
+      cityZip, zip,
+      school:safe_(row,idx[H.school]),
+      listingType:safe_(row,idx[H.listingType]),
+      totalSf:safe_(row,idx[H.totalSf]),
+      dollarSfMo:safe_(row,idx[H.dollarSfMo]),
+      priceRent:safe_(row,idx[H.priceRent]),
+      annualCost:safe_(row,idx[H.annualCost]),
+      jurisdiction:safe_(row,idx[H.jurisdiction]),
+      plannedLandUse:safe_(row,idx[H.plannedLandUse]),
+      zoning:safe_(row,idx[H.zoning]),
+      propertyType:safe_(row,idx[H.propertyType]),
+      yearBuilt:safe_(row,idx[H.yearBuilt]),
+      parkingSpaces:safe_(row,idx[H.parkingSpaces]),
+      lotAc:safe_(row,idx[H.lotAc]),
+      classMaxStudents:safe_(row,idx[H.classMaxStudents]),
+      lat:safe_(row,idx[H.lat]),
+      lng:safe_(row,idx[H.lng])
+    };
+    if (!zipOnly || rec.zip===CONFIG.ZIP_FILTER) out.push(rec);
+  }
+  return {rows:out, headers, idx};
+}
+
+function ensureColumns_(sh, headers, names){
+  const have=new Set(headers); let added=0;
+  names.forEach(n=>{
+    if(n && !have.has(n)){ sh.getRange(1, sh.getLastColumn()+1).setValue(n); have.add(n); added++; }
+  });
+  if (added) {
+    return sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0]; // refreshed headers
+  }
+  return headers;
+}
+function extractZip_(cityZip){ if(!cityZip) return ''; const m=String(cityZip).match(/(\d{5})(-\d{4})?$/); return m?m[1]:''; }
+function hasAny_(text, arr){ const t=(text||'').toUpperCase(); return arr.some(k=>t.includes(k)); }
+function round1_(n){ return n==null?'':Math.round(n*10)/10; }
+function num_(val){ if(val==null||val==='') return null; const m=String(val).replace(/[, $]/g,'').match(/-?\d+(\.\d+)?/); return m?Number(m[0]):null; }
+function buildStaticMapUrl_(latLngList, apiKey){
+  const base='https://maps.googleapis.com/maps/api/staticmap';
+  const params=['size=1000x500','maptype=roadmap','scale=2'];
+  const color='0xb09446'; // gold pins
+  latLngList.forEach(ll=>params.push('markers=color:'+color+'|'+encodeURIComponent(ll)));
+  params.push('key='+apiKey);
+  return base+'?'+params.join('&');
+}
+function mapsApiKey_(){
+  return PropertiesService.getScriptProperties().getProperty('MAPS_API_KEY') || CONFIG.API_KEY || '';
+}
